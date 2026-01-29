@@ -1,0 +1,90 @@
+import time
+import subprocess
+from collections import defaultdict
+from scapy.all import sniff, IP, TCP
+import tkinter as tk
+from tkinter.scrolledtext import ScrolledText
+import threading
+
+# ================= CONFIG =================
+SCAN_PORT_THRESHOLD = 10      # Number of ports to trigger detection
+TIME_WINDOW = 10              # Seconds
+INTERFACE = "enp0s3"
+LOG_FILE = "nids_alerts.log"
+
+# ================= DATA =================
+scan_tracker = defaultdict(lambda: {"ports": set(), "start": time.time()})
+blocked_ips = set()
+
+# ================= IPTABLES BLOCK =================
+def block_ip(ip):
+    if ip not in blocked_ips:
+        subprocess.run(
+            ["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        blocked_ips.add(ip)
+        log_event(f"[BLOCKED] {ip}")
+
+# ================= LOGGING =================
+def log_event(msg):
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{time.ctime()} - {msg}\n")
+    gui_log(msg)
+
+# ================= GUI =================
+def gui_log(message):
+    output.insert(tk.END, message + "\n")
+    output.see(tk.END)
+
+# ================= DETECTION =================
+def detect_scan(packet):
+    if packet.haslayer(IP) and packet.haslayer(TCP):
+        src = packet[IP].src
+
+        # Ignore already blocked IPs
+        if src in blocked_ips:
+            return
+
+        # SYN packet check
+        if packet[TCP].flags & 0x02:
+            tracker = scan_tracker[src]
+            tracker["ports"].add(packet[TCP].dport)
+
+            elapsed = time.time() - tracker["start"]
+
+            if elapsed <= TIME_WINDOW:
+                if len(tracker["ports"]) >= SCAN_PORT_THRESHOLD:
+                    log_event(f"[VULN SCAN DETECTED] {src} scanned {len(tracker['ports'])} ports")
+                    block_ip(src)
+
+                    # Stop tracking this IP completely
+                    scan_tracker.pop(src, None)
+            else:
+                # Reset tracker after time window
+                scan_tracker[src] = {"ports": set(), "start": time.time()}
+
+# ================= SNIFFER =================
+def start_sniffer():
+    log_event("[INFO] NIDS started – monitoring vulnerability scans")
+    sniff(
+        iface=INTERFACE,
+        filter="tcp",
+        prn=detect_scan,
+        store=0
+    )
+
+# ================= GUI SETUP =================
+root = tk.Tk()
+root.title("Python NIDS – Auto Blocker")
+root.geometry("700x400")
+
+output = ScrolledText(root, bg="black", fg="lime", font=("Courier", 10))
+output.pack(fill=tk.BOTH, expand=True)
+
+# ================= THREAD =================
+sniffer_thread = threading.Thread(target=start_sniffer, daemon=True)
+sniffer_thread.start()
+
+root.mainloop()
